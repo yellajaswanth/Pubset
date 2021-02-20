@@ -1,0 +1,14 @@
+fillgap_log/
+auto_log/
+__pycache__/
+.ipynb_checkpoints/
+dataset/
+models/
+*.tar.gz
+*.txt
+*.log
+*.pyc
+*.pkl
+*.ipynb
+.DS_Store/
+
