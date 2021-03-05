@@ -24,6 +24,15 @@ from pytorch_pretrained_bert_inset import GPT2LMHeadModel, GPT2Tokenizer, GPT2Co
 
 from pytorch_pretrained_bert_inset import BertModel, BertConfig
 
+n_gpu = torch.cuda.device_count()
+
+if n_gpu > 1:
+    from torch.distributed import get_rank, get_world_size
+    from data_loader_auto import DistributedBucketingDataLoader
+    from gpt2_training.distributed import all_reduce_and_rescale_tensors, all_gather_list
+
+
+
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
@@ -71,6 +80,9 @@ parser.add_argument("--top_k", type=int, default=0)
 parser.add_argument('--unconditional', action='store_true', help='If true, unconditional generation.')
 parser.add_argument('--is_sampling', action='store_true', help='If true, sampling for generation.')
 
+parser.add_argument('--local_rank', type=int, default=-1,
+                    help='for torch.distributed')
+
 args = parser.parse_args()
 
 assert args.train_batch_size % args.gradient_accumulation_steps == 0, 'batch size % gradient accumulation steps != 0!'
@@ -79,9 +91,23 @@ args.train_batch_size = args.train_batch_size // args.gradient_accumulation_step
 logger.info('train batch size = {}, new train batch size (after gradient accumulation) = {}'.format(
     args.train_batch_size*args.gradient_accumulation_steps, args.train_batch_size))
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-n_gpu = torch.cuda.device_count()
-args.device, args.n_gpu = device, n_gpu
+if args.local_rank == -1:
+    logger.info('CUDA available? {}'.format(str(torch.cuda.is_available())))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    n_gpu = torch.cuda.device_count()
+    args.device, args.n_gpu = device, n_gpu
+else:
+    # distributed training
+    torch.cuda.set_device(args.local_rank)
+    device = torch.device("cuda", args.local_rank)
+    # Initializes the distributed backend which will take care of
+    # sychronizing nodes/GPUs
+    torch.distributed.init_process_group(backend='nccl')
+    n_gpu = torch.distributed.get_world_size()
+    args.device, args.n_gpu = device, 1
+    logger.info("device: {} n_gpu: {}, distributed training: {}, "
+                "16-bits training: {}".format(
+                    device, n_gpu, bool(args.local_rank != -1), args.fp16))
 
 np.random.seed(args.seed)
 torch.random.manual_seed(args.seed)
@@ -117,7 +143,13 @@ train_path = 'dataset/db/pubmed_train.db'
 
 test_path = 'dataset/db/pubmed_test.db'
 
-train_dataloader = BucketingDataLoader(train_path, args.train_batch_size, args.max_seq_length)
+if args.local_rank == -1:
+    train_dataloader = BucketingDataLoader(train_path, args.train_batch_size, args.max_seq_length)
+else:
+    train_dataloader = DistributedBucketingDataLoader(
+        get_rank(), get_world_size(),
+        train_path, args.train_batch_size,
+        args.max_seq_length)
 
 eval_dataloader_loss = PubmedDynamicBatchingLoader(test_path, args.eval_batch_size, args.max_seq_length, is_train=True)
 
@@ -140,6 +172,19 @@ model_bert = BertModel.from_pretrained('biobert-base').cuda()
 model_gpt = load_model(GPT2LMHeadModel(config), args.init_checkpoint, args)
 model_pre = GPT2LMHeadModel(config).cuda()
 
+if args.local_rank != -1:
+    # when from scratch make sure initial models are the same
+    params_gpt = [p.data for p in model_gpt.parameters()]
+    all_reduce_and_rescale_tensors(
+        params_gpt, float(torch.distributed.get_world_size()))
+
+    params_bert = [p.data for p in model_bert.parameters()]
+    all_reduce_and_rescale_tensors(
+        params_bert, float(torch.distributed.get_world_size()))
+
+    params_pre = [p.data for p in model_pre.parameters()]
+    all_reduce_and_rescale_tensors(
+        params_pre, float(torch.distributed.get_world_size()))
 
 
 model_parameters = filter(lambda p: p.requires_grad, model_gpt.parameters())
@@ -188,10 +233,17 @@ global_step = int(len(train_dataloader) / args.gradient_accumulation_steps * arg
 
 EVAL_STEP = len(train_dataloader)   # record every EPOCH
 EVAL_STEP = 500
-train_logger = open(os.path.join(log_dir, 'train_log.txt'), 'a+', buffering=1)
-eval_logger = open(os.path.join(log_dir, 'eval_log.txt'), 'a+', buffering=1)
-print('epoch,global_step,step,mean_loss,mean_ppl,n_token_real,n_token_total,epoch_time,accuracy', file=train_logger)
-print('epoch,global_step,step,eval_loss,eval_ppl,accuracy', file=eval_logger)
+
+if args.local_rank == -1 or get_rank() == 0:
+    train_logger = open(join(log_dir, 'train_log.txt'), 'a+', buffering=1)
+    eval_logger = open(join(log_dir, 'eval_log.txt'), 'a+', buffering=1)
+    print('epoch,global_step,step,mean_loss,mean_ppl,n_token_real,'
+          'n_token_total,epoch_time', file=train_logger)
+    print('epoch,global_step,step,eval_loss,eval_ppl', file=eval_logger)
+
+if args.local_rank != -1:
+    n_gpu = 1
+
 for epoch in range(args.continue_from, args.num_epochs):
     # eval first
     model_bert.train()
@@ -258,6 +310,21 @@ for epoch in range(args.continue_from, args.num_epochs):
                     lr_this_step = args.learning_rate * warmup_linear(global_step / num_train_optimization_steps, args.warmup_proportion)
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = lr_this_step
+
+            if args.local_rank != -1:
+                # when from scratch make sure initial models are the same
+                params_gpt = [p.data for p in model_gpt.parameters()]
+                all_reduce_and_rescale_tensors(
+                    params_gpt, float(torch.distributed.get_world_size()))
+
+                params_bert = [p.data for p in model_bert.parameters()]
+                all_reduce_and_rescale_tensors(
+                    params_bert, float(torch.distributed.get_world_size()))
+
+                params_pre = [p.data for p in model_pre.parameters()]
+                all_reduce_and_rescale_tensors(
+                    params_pre, float(torch.distributed.get_world_size()))
+
             optimizer.step()
             optimizer.zero_grad()
             global_step += 1
@@ -265,20 +332,22 @@ for epoch in range(args.continue_from, args.num_epochs):
         torch.cuda.empty_cache()
 
         if (step + 1) % EVAL_STEP == 0:
-            print('saving checkpoints...')
-            torch.save(model_bert.state_dict(), os.path.join(output_dir, 'BERT-pretrain-%d-step-%d.pkl' % (epoch + 1, step + 1)))
-            torch.save(model_gpt.state_dict(), os.path.join(output_dir, 'GPT2-pretrain-%d-step-%d.pkl' % (epoch + 1, step + 1)))
-            torch.save(model_pre.state_dict(), os.path.join(output_dir, 'PRE-pretrain-%d-step-%d.pkl' % (epoch + 1, step + 1)))
-                # disable generation step evaluation for now
-            eval_loss, eval_ppl, eval_correct = eval_model_loss(model_bert, model_gpt, model_pre, eval_dataloader_loss, epoch, args)
-            gen_response = eval_model_generation(model_bert, model_gpt, model_pre, enc, eval_dataloader_gen, epoch, args)
-            print('{},{},{},{},{},{}'.format(epoch+1, global_step+1, step+1, eval_loss, eval_ppl, eval_correct), file=eval_logger)
-            sys.stdout.flush()
-            model_bert.train()
-            model_gpt.train()
-            model_pre.train()
+            if args.local_rank == -1 or get_rank() == 0:
+                print('saving checkpoints...')
+                torch.save(model_bert.state_dict(), os.path.join(output_dir, 'BERT-pretrain-%d-step-%d.pkl' % (epoch + 1, step + 1)))
+                torch.save(model_gpt.state_dict(), os.path.join(output_dir, 'GPT2-pretrain-%d-step-%d.pkl' % (epoch + 1, step + 1)))
+                torch.save(model_pre.state_dict(), os.path.join(output_dir, 'PRE-pretrain-%d-step-%d.pkl' % (epoch + 1, step + 1)))
+                    # disable generation step evaluation for now
+                eval_loss, eval_ppl, eval_correct = eval_model_loss(model_bert, model_gpt, model_pre, eval_dataloader_loss, epoch, args)
+                gen_response = eval_model_generation(model_bert, model_gpt, model_pre, enc, eval_dataloader_gen, epoch, args)
+                print('{},{},{},{},{},{}'.format(epoch+1, global_step+1, step+1, eval_loss, eval_ppl, eval_correct), file=eval_logger)
+                sys.stdout.flush()
+                model_bert.train()
+                model_gpt.train()
+                model_pre.train()
 
         torch.cuda.empty_cache()
 
-train_logger.close()
-eval_logger.close()
+if args.local_rank == -1 or get_rank() == 0:
+    train_logger.close()
+    eval_logger.close()
